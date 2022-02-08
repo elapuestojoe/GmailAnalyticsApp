@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 import csv
+from email import message
 import os.path
-import time
+import pickle
+import re
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -11,7 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
+MAIL_REGEX = r"[\w\.\+\-\_]+@[\w\.\-\_]+\.[\w\d]+"
 
 class GmailClient:
   creds = None
@@ -25,7 +27,7 @@ class GmailClient:
       if self.creds and self.creds.expired and self.creds.refresh_token:
         self.creds.refresh(Request())
       else:
-        flow = InstalledAppFlow.from_client_secrets_file('creds.json', scopes=SCOPES, redirect_uri='https://kevin-islas.com')
+        flow = InstalledAppFlow.from_client_secrets_file('creds.json', scopes=SCOPES)
         self.creds = flow.run_local_server(port = 0)
 
       # Save the credentials for the next run
@@ -36,7 +38,6 @@ class GmailClient:
       # Call the Gmail API
       self.gmail_service = build('gmail', 'v1', credentials=self.creds)
     except HttpError as error:
-      # TODO(joe) - Handle error from gmail API
       print(f"An error ocurred: {error}")
 
   def GetMessages(self, user_id, page_token=None):
@@ -54,23 +55,34 @@ class GmailClient:
       print("No payload")
       return
     for header in payload.get('headers', []):
-      is_from_header = header.get('name', None) == "From"
+      is_from_header = header.get('name', '').lower() == "from"
       if is_from_header:
         from_address = header.get('value', None)
         from_address = from_address.replace('"', '')
         from_address = from_address.encode("UTF-8", errors='ignore')
         return from_address
     print("No from address found")
-    return None
+    print(payload)
+    return "Unknown".encode("UTF-8", errors='ignore')
 
-def GetMessageSender(user_id, message_id):
+def GetMessageSenderAndStatus(user_id, message_id):
   tmp_gmail_client = GmailClient()
   if (user_id is None or message_id is None):
     print("user_id and message_id must not be none")
     return ""
   message = tmp_gmail_client.GetMessage(user_id, message_id)
-  sender = GmailClient.GetMessageSenderInternal(message)
-  return sender
+  senderRaw = GmailClient.GetMessageSenderInternal(message)
+  senderReg = re.search(MAIL_REGEX, senderRaw.decode('Utf-8'))
+  sender = "unknown"
+  if senderReg is None:
+    print("ERROR extracting mail")
+    print(senderRaw.decode('utf8'))
+  else:
+    sender = senderReg.group(0)
+  unread = False
+  if "UNREAD" in message.get('labelIds', []):
+    unread = True
+  return {"sender": sender, "unread": unread, "id": message.get('id', '')}
 
 
 def main():
@@ -79,7 +91,7 @@ def main():
   """
   gmail_client = GmailClient()
   next_page_token = None
-  all_messages = []
+  all_messages = set()
   messages_max_size_500_bucket = 0
   while(True):
     current_bucket = len(all_messages) // 500
@@ -89,28 +101,47 @@ def main():
 
     result = gmail_client.GetMessages('me', next_page_token)
     next_page_token = result.get('nextPageToken', None)
-    new_messages = result.get('messages', [])
-  
-    if (next_page_token is None or len(new_messages) == 0):
-      break
-    all_messages += new_messages
+    new_messages_obj = result.get('messages', [])
 
+    if (next_page_token is None or len(new_messages_obj) == 0):
+      break
+
+    for message in new_messages_obj:
+      all_messages.add(message.get("id", ""))
+
+  read_messages = set()
+  if os.path.exists("read_messages.bin"):
+    with open('read_messages.bin', 'rb') as read_messages_file:
+      read_messages = pickle.load(read_messages_file)
+
+  with open('all_messages.bin', 'wb') as all_messages_file:
+    pickle.dump(all_messages, all_messages_file)
+    
   senders = {}
   sender_count = 0
+
+  unread_messages = all_messages.difference(read_messages)
   with ThreadPoolExecutor(max_workers=10) as executor:
-    futures_response = {executor.submit(GetMessageSender, "me", message_metadata.get("id", None)): message_metadata for message_metadata in all_messages}
+    futures_response = {executor.submit(GetMessageSenderAndStatus, "me", message_id): message_id for message_id in unread_messages}
     for future in as_completed(futures_response):
       try:
-        sender = future.result()
-        sender_count += 1
-        if (sender_count % 1000 == 0):
-          print(sender_count)
-        if (sender not in senders):
-          senders[sender] = 1
+        response = future.result()
+        if (response.get('unread', False)):
+          sender_count += 1
+          sender = response.get('sender', '')
+          if (sender_count % 1000 == 0):
+            print(sender_count)
+          if (sender not in senders):
+            senders[sender] = 1
+          else:
+            senders[sender] = senders[sender] + 1
         else:
-          senders[sender] = senders[sender] + 1
+          read_messages.add(response.get('id', ''))
       except Exception as exc:
         print('%r generated an exception: %s' % (futures_response[future], exc))
+
+  with open('read_messages.bin', 'wb') as read_messages_file:
+      pickle.dump(read_messages, read_messages_file)
 
   print("done")
   with open("output_threaded.csv", "w", newline="") as output_csv_path:
